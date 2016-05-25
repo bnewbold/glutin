@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["ActivationPolicy","Corresponds to `NSApplicationActivationPolicy`."]],"trait":[["WindowBuilderExt","Additional methods on `WindowBuilder` that are specific to MacOS."],["WindowExt","Additional methods on `Window` that are specific to MacOS."]]});
