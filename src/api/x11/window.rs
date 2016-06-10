@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::os::raw::c_long;
 use std::thread;
 use std::time::Duration;
+use std::os::raw::c_ulong;
 
 use Api;
 use ContextError;
@@ -699,6 +700,237 @@ impl Window {
                 }
             }
         }
+
+        // returning
+        Ok(window)
+    }
+
+    /// Instead of actually creating an X11 window and returning a handle to
+    /// it, this function will use Xlib to find a pre-existing window (eg, one
+    /// created by another process) and return a wrapper for that.
+    ///
+    /// `window_attrs` and `pf_reqs` will mostly be ignored, while the `opengl`
+    /// attributes will be honored.
+    ///
+    /// `window_id` is the X window id of the existing window. This can be
+    /// found with, eg, the `xwininfo -tree` command. If the window can't be
+    /// found, an error will be returned.
+    ///
+    /// You almost certainly want to use `new()` instead, unless you are doing
+    /// something like drawing into an embedded sub-window of an existing
+    /// application.
+    pub fn from_existing_window(display: &Arc<XConnection>, window_attrs: &WindowAttributes,
+                                pf_reqs: &PixelFormatRequirements, opengl: &GlAttributes<&Window>,
+                                window_id: c_ulong)
+                                -> Result<Window, CreationError>
+    {
+
+        // check early that window_id actually exists, and grab attributes for it
+        let window = window_id;
+        let (screen_id, root) = unsafe {
+            let mut existing_attr: ffi::XWindowAttributes = mem::uninitialized();
+            (display.xlib.XGetWindowAttributes)(display.display, window_id, &mut existing_attr);
+            display.check_errors().expect("window_id did not map to an accessible existing window");
+            // Seems like there would be a cleaner way to find the screen_number, but there doesn't seem to be.
+            let max_screen_id = (display.xlib.XScreenCount)(display.display);
+            let mut screen_id = 0;
+            for id in 0..max_screen_id {
+                if existing_attr.screen == (display.xlib.XScreenOfDisplay)(display.display, id) {
+                    screen_id = id;
+                    break;
+                }
+                display.check_errors().expect("Problem fetching screen info");
+                if id == max_screen_id {
+                    return Err(CreationError::OsError(format!("Couldn't find screen_number for window's screen")));
+                }
+            }
+            // get the root window handle
+            let root = existing_attr.root;
+            (screen_id, root)
+        };
+
+        // We aren't handling mode changes, so pretend we're not full-screen
+        // (even if existing window is)
+        let is_fullscreen = false;
+        let xf86_desk_mode = None;
+
+        // start the (OpenGL) context building process (same as new())
+        enum Prototype<'a> {
+            Glx(::api::glx::ContextPrototype<'a>),
+            Egl(::api::egl::ContextPrototype<'a>),
+        }
+        let builder_clone_opengl_glx = opengl.clone().map_sharing(|_| unimplemented!());      // FIXME:
+        let builder_clone_opengl_egl = opengl.clone().map_sharing(|_| unimplemented!());      // FIXME:
+        let context = match opengl.version {
+            GlRequest::Latest | GlRequest::Specific(Api::OpenGl, _) | GlRequest::GlThenGles { .. } => {
+                // GLX should be preferred over EGL, otherwise crashes may occur
+                // on X11 – issue #314
+                if let Some(ref glx) = display.glx {
+                    Prototype::Glx(try!(GlxContext::new(glx.clone(), &display.xlib, pf_reqs, &builder_clone_opengl_glx, display.display, screen_id)))
+                } else if let Some(ref egl) = display.egl {
+                    Prototype::Egl(try!(EglContext::new(egl.clone(), pf_reqs, &builder_clone_opengl_egl, egl::NativeDisplay::X11(Some(display.display as *const _)))))
+                } else {
+                    return Err(CreationError::NotSupported);
+                }
+            },
+            GlRequest::Specific(Api::OpenGlEs, _) => {
+                if let Some(ref egl) = display.egl {
+                    Prototype::Egl(try!(EglContext::new(egl.clone(), pf_reqs, &builder_clone_opengl_egl, egl::NativeDisplay::X11(Some(display.display as *const _)))))
+                } else {
+                    return Err(CreationError::NotSupported);
+                }
+            },
+            GlRequest::Specific(_, _) => {
+                return Err(CreationError::NotSupported);
+            },
+        };
+
+        // getting the `visual_infos` (a struct that contains information about the visual to use) (same as new() )
+        let visual_infos = match context {
+            Prototype::Glx(ref p) => p.get_visual_infos().clone(),
+            Prototype::Egl(ref p) => {
+                unsafe {
+                    let mut template: ffi::XVisualInfo = mem::zeroed();
+                    template.visualid = p.get_native_visual_id() as ffi::VisualID;
+
+                    let mut num_visuals = 0;
+                    let vi = (display.xlib.XGetVisualInfo)(display.display, ffi::VisualIDMask,
+                                                           &mut template, &mut num_visuals);
+                    display.check_errors().expect("Failed to call XGetVisualInfo");
+                    assert!(!vi.is_null());
+                    assert!(num_visuals == 1);
+
+                    let vi_copy = ptr::read(vi as *const _);
+                    (display.xlib.XFree)(vi as *mut _);
+                    vi_copy
+                }
+            },
+        };
+
+        // creating the color map (same as new() )
+        let cmap = unsafe {
+            let cmap = (display.xlib.XCreateColormap)(display.display, root,
+                                                      visual_infos.visual as *mut _,
+                                                      ffi::AllocNone);
+            display.check_errors().expect("Failed to call XCreateColormap");
+            cmap
+        };
+
+        // subscribe to particular events (*not* the same as new() )
+        let mut set_win_attr = {
+            let mut swa: ffi::XSetWindowAttributes = unsafe { mem::zeroed() };
+            swa.event_mask = ffi::ExposureMask | ffi::StructureNotifyMask |
+                ffi::VisibilityChangeMask | ffi::KeyPressMask | ffi::PointerMotionMask |
+                ffi::KeyReleaseMask | ffi::ButtonPressMask |
+                ffi::ButtonReleaseMask | ffi::KeymapStateMask;
+            swa.override_redirect = 0;
+            swa
+        };
+
+        let window_attributes = ffi::CWEventMask;
+
+        /* XXX: This seems important, but results in failure
+        unsafe {
+            (display.xlib.XChangeWindowAttributes)(display.display, window_id, window_attributes, &mut set_win_attr);
+        }
+        display.check_errors().expect("Failed to (re)configure existing X window");
+        */
+
+        // creating window, step 2
+        let wm_delete_window = unsafe {
+            let mut wm_delete_window = with_c_str("WM_DELETE_WINDOW", |delete_window|
+                (display.xlib.XInternAtom)(display.display, delete_window, 0)
+            );
+            display.check_errors().expect("Failed to call XInternAtom");
+            (display.xlib.XSetWMProtocols)(display.display, window, &mut wm_delete_window, 1);
+            display.check_errors().expect("Failed to call XSetWMProtocols");
+            (display.xlib.XFlush)(display.display);
+            display.check_errors().expect("Failed to call XFlush");
+
+            wm_delete_window
+        };
+
+        // creating IM
+        let im = unsafe {
+            let _lock = GLOBAL_XOPENIM_LOCK.lock().unwrap();
+
+            let im = (display.xlib.XOpenIM)(display.display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+            if im.is_null() {
+                return Err(OsError(format!("XOpenIM failed")));
+            }
+            im
+        };
+
+        // creating input context
+        let ic = unsafe {
+            let ic = with_c_str("inputStyle", |input_style|
+                with_c_str("clientWindow", |client_window|
+                    (display.xlib.XCreateIC)(
+                        im, input_style,
+                        ffi::XIMPreeditNothing | ffi::XIMStatusNothing, client_window,
+                        window, ptr::null::<()>()
+                    )
+                )
+            );
+            if ic.is_null() {
+                return Err(OsError(format!("XCreateIC failed")));
+            }
+            (display.xlib.XSetICFocus)(ic);
+            display.check_errors().expect("Failed to call XSetICFocus");
+            ic
+        };
+
+        // Attempt to make keyboard input repeat detectable
+        unsafe {
+            let mut supported_ptr = ffi::False;
+            (display.xlib.XkbSetDetectableAutoRepeat)(display.display, ffi::True, &mut supported_ptr);
+            if supported_ptr == ffi::False {
+                return Err(OsError(format!("XkbSetDetectableAutoRepeat failed")));
+            }
+        }
+
+        // finish creating the OpenGL context
+        let context = match context {
+            Prototype::Glx(ctxt) => {
+                Context::Glx(try!(ctxt.finish(window)))
+            },
+            Prototype::Egl(ctxt) => {
+                Context::Egl(try!(ctxt.finish(window as *const libc::c_void)))
+            },
+        };
+
+        // creating the OpenGL can produce errors, but since everything is checked we ignore
+        display.ignore_error();
+
+        // creating the window object
+        let window_proxy_data = WindowProxyData {
+            display: display.clone(),
+            window: window,
+        };
+        let window_proxy_data = Arc::new(Mutex::new(Some(window_proxy_data)));
+
+        let window = Window {
+            x: Arc::new(XWindow {
+                display: display.clone(),
+                window: window,
+                im: im,
+                ic: ic,
+                context: context,
+                screen_id: screen_id,
+                is_fullscreen: is_fullscreen,
+                xf86_desk_mode: xf86_desk_mode,
+                colormap: cmap,
+                window_proxy_data: window_proxy_data,
+            }),
+            is_closed: AtomicBool::new(false),
+            wm_delete_window: wm_delete_window,
+            current_size: Cell::new((0, 0)),
+            pending_events: Mutex::new(VecDeque::new()),
+            cursor_state: Mutex::new(CursorState::Normal),
+            input_handler: Mutex::new(XInputEventHandler::new(display, window, ic, window_attrs))
+        };
+
+        // Don't set title or "make visible"
 
         // returning
         Ok(window)

@@ -21,9 +21,14 @@ use api::x11;
 use api::x11::XConnection;
 use api::x11::XError;
 use api::x11::XNotSupported;
+use std::os::raw::c_ulong;
 
 #[derive(Clone, Default)]
-pub struct PlatformSpecificWindowBuilderAttributes;
+pub struct PlatformSpecificWindowBuilderAttributes {
+    /// Optionally tells the WindowBuilder to re-use an existing X window with
+    /// the given Window id number
+    pub existing_x11_window_id: Option<c_ulong>,
+}
 
 enum Backend {
     X(Arc<XConnection>),
@@ -175,7 +180,7 @@ impl<'a> Iterator for WaitEventsIterator<'a> {
 impl Window {
     #[inline]
     pub fn new(window: &WindowAttributes, pf_reqs: &PixelFormatRequirements,
-               opengl: &GlAttributes<&Window>, _: &PlatformSpecificWindowBuilderAttributes)
+               opengl: &GlAttributes<&Window>, platform: &PlatformSpecificWindowBuilderAttributes)
                -> Result<Window, CreationError>
     {
         match *BACKEND {
@@ -194,7 +199,10 @@ impl Window {
                     _ => panic!()       // TODO: return an error
                 });
 
-                x11::Window::new(connec, window, pf_reqs, &opengl).map(Window::X)
+                match platform.existing_x11_window_id {
+                    None => x11::Window::new(connec, window, pf_reqs, &opengl).map(Window::X),
+                    Some(window_id) => x11::Window::from_existing_window(connec, window, pf_reqs, &opengl, window_id).map(Window::X),
+                }
             },
 
             Backend::Error(ref error) => Err(CreationError::NoBackendAvailable(Box::new(error.clone())))
