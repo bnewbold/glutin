@@ -118,7 +118,7 @@ pub struct WindowBuilder<'a> {
     pf_reqs: PixelFormatRequirements,
 
     /// Platform-specific configuration.
-    platform_specific: platform::PlatformSpecificWindowBuilderAttributes,
+    pub platform_specific: platform::PlatformSpecificWindowBuilderAttributes,
 }
 
 /// Trait that describes objects that have access to an OpenGL context.
