@@ -2,3 +2,10 @@ Cargo.lock
 target/
 *~
 #*#
+*.swp
+*.tmp
+[Tt]humbs.db
+*.DS_Store
+
+# Don't ignore this file itself
+!.gitignore
